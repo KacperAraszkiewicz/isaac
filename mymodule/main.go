@@ -15,7 +15,277 @@ import (
 	"github.com/faiface/pixel/imdraw"
 )
 
+func DrawMiniMap(win *pixelgl.Window) {
+	im := imdraw.New(nil)
+
+	roomSize := 18.0
+	spacing := 26.0
+
+	// pozycja minimapy
+	origin := pixel.V(80, 1000)
+
+	// przesunięcie względem aktualnego pokoju
+	offsetX := float64(currentRoom.X) * spacing
+	offsetY := float64(currentRoom.Y) * spacing
+
+	for _, room := range gameMap {
+		x := origin.X + float64(room.X)*spacing - offsetX
+		y := origin.Y + float64(room.Y)*spacing - offsetY
+
+		// kolor pokoju
+		switch room.Type {
+		case StartRoom:
+			im.Color = colornames.Dodgerblue
+		case NormalRoom:
+			im.Color = colornames.White
+		case BossRoom:
+			im.Color = colornames.Red
+		case ItemRoom:
+			im.Color = colornames.Gold
+		}
+
+		im.Push(
+			pixel.V(x-roomSize/2, y-roomSize/2),
+			pixel.V(x+roomSize/2, y+roomSize/2),
+		)
+		im.Rectangle(0)
+
+		// połączenia (drzwi)
+		im.Color = colornames.Gray
+		for dir := range room.Doors {
+			switch dir {
+			case "up":
+				im.Push(pixel.V(x, y+roomSize/2), pixel.V(x, y+spacing-roomSize/2))
+			case "down":
+				im.Push(pixel.V(x, y-roomSize/2), pixel.V(x, y-spacing+roomSize/2))
+			case "left":
+				im.Push(pixel.V(x-roomSize/2, y), pixel.V(x-spacing+roomSize/2, y))
+			case "right":
+				im.Push(pixel.V(x+roomSize/2, y), pixel.V(x+spacing-roomSize/2, y))
+			}
+			im.Line(2)
+		}
+
+		// aktualny pokój – zielona ramka
+		if room == currentRoom {
+			im.Color = colornames.Limegreen
+			im.Push(
+				pixel.V(x-roomSize/2-2, y-roomSize/2-2),
+				pixel.V(x+roomSize/2+2, y+roomSize/2+2),
+			)
+			im.Rectangle(2)
+		}
+	}
+
+	im.Draw(win)
+}
+
+
+// Deklaracja lez bossa
+var (
+	bossTears []*struktury_i_funkcje.BossTear
+	bossTearsMux sync.Mutex
+)
+
+// Deklaracja Husha
+var (
+	hushes []*struktury_i_funkcje.Hush
+	hushMux sync.Mutex
+	hushDrawn = false
+	hushDead = false
+	bossHush *struktury_i_funkcje.Hush
+)
+
+// Deklaracja Gurdiego
+var (
+	gurdys []*struktury_i_funkcje.Gurdy
+	gurdyMux sync.Mutex
+	gurdyRespawn = time.Now()
+	gurdyDrawn = false
+	gurdyDead = true
+	bossGurdy *struktury_i_funkcje.Gurdy
+)
+
+var itemTaken = false
+
+func OnEnterRoom() {
+	// reset bossów
+	gurdyDrawn = false
+	gurdyDead = true
+	gurdys = nil
+
+	hushDrawn = false
+	hushDead = false
+	hushes = nil
+
+	// reset pocisków
+	bossTears = nil
+
+	// reset itemu
+	itemTaken = false
+}
+
+
+// ================= MAPA / POKOJE =================
+
+type RoomType int
+
+const (
+	StartRoom RoomType = iota
+	NormalRoom
+	BossRoom
+	ItemRoom
+)
+
+type Room struct {
+	X, Y  int
+	Type  RoomType
+	Doors map[string]bool // "up","down","left","right"
+}
+
+var directions = map[string][2]int{
+	"up":    {0, 1},
+	"down":  {0, -1},
+	"left":  {-1, 0},
+	"right": {1, 0},
+}
+
+func opposite(dir string) string {
+	switch dir {
+	case "up":
+		return "down"
+	case "down":
+		return "up"
+	case "left":
+		return "right"
+	case "right":
+		return "left"
+	}
+	return ""
+}
+
+
+func GenerateMap() map[[2]int]*Room {
+	rand.Seed(time.Now().UnixNano())
+
+	rooms := make(map[[2]int]*Room)
+
+	start := &Room{
+		X: 0, Y: 0,
+		Type:  StartRoom,
+		Doors: make(map[string]bool),
+	}
+	rooms[[2]int{0, 0}] = start
+
+	frontier := []*Room{start}
+
+	for len(rooms) < 8 {
+		base := frontier[rand.Intn(len(frontier))]
+
+		var possible []string
+		for dir := range directions {
+			dx, dy := directions[dir][0], directions[dir][1]
+			pos := [2]int{base.X + dx, base.Y + dy}
+			if _, exists := rooms[pos]; !exists {
+				possible = append(possible, dir)
+			}
+		}
+
+		if len(possible) == 0 {
+			continue
+		}
+
+		dir := possible[rand.Intn(len(possible))]
+		dx, dy := directions[dir][0], directions[dir][1]
+
+		newRoom := &Room{
+			X: base.X + dx,
+			Y: base.Y + dy,
+			Type:  NormalRoom,
+			Doors: make(map[string]bool),
+		}
+
+		base.Doors[dir] = true
+		newRoom.Doors[opposite(dir)] = true
+
+		rooms[[2]int{newRoom.X, newRoom.Y}] = newRoom
+		frontier = append(frontier, newRoom)
+	}
+
+	assignSpecialRooms(rooms)
+	return rooms
+}
+
+func assignSpecialRooms(rooms map[[2]int]*Room) {
+	var start *Room
+	for _, r := range rooms {
+		if r.Type == StartRoom {
+			start = r
+			break
+		}
+	}
+
+	dist := make(map[*Room]int)
+	queue := []*Room{start}
+	dist[start] = 0
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		for dir := range cur.Doors {
+			dx, dy := directions[dir][0], directions[dir][1]
+			n := rooms[[2]int{cur.X + dx, cur.Y + dy}]
+			if _, ok := dist[n]; !ok {
+				dist[n] = dist[cur] + 1
+				queue = append(queue, n)
+			}
+		}
+	}
+
+	var boss *Room
+	maxDist := -1
+	for r, d := range dist {
+		if d > maxDist && r.Type == NormalRoom {
+			maxDist = d
+			boss = r
+		}
+	}
+	boss.Type = BossRoom
+
+	for _, r := range rooms {
+		if r.Type == NormalRoom && len(r.Doors) == 1 {
+			r.Type = ItemRoom
+			break
+		}
+	}
+}
+
+func ChangeRoom(dir string) {
+	if !currentRoom.Doors[dir] {
+		return
+	}
+
+	dx, dy := directions[dir][0], directions[dir][1]
+	currentRoom = gameMap[[2]int{currentRoom.X + dx, currentRoom.Y + dy}]
+
+	OnEnterRoom()
+}
+
+
+// ===== MAPA =====
+var (
+	gameMap     map[[2]int]*Room
+	currentRoom *Room
+)
+
+
 func run() {
+
+
+	gameMap = GenerateMap()
+	currentRoom = gameMap[[2]int{0, 0}]
+
 	// Wczytywanie okna
 	cfg := pixelgl.WindowConfig{
 		Title:     "Isaac",
@@ -132,6 +402,10 @@ func run() {
 	piedestalHitbox := pixel.R(880, 540, 980, 640)
 	wziacItem := pixel.R(881, 541, 981, 641)
 
+	gameMap = GenerateMap()
+	currentRoom = gameMap[[2]int{0, 0}]
+
+
 	// Kolekcja lez
 	var (
 		tears []*struktury_i_funkcje.Tear
@@ -146,9 +420,7 @@ func run() {
 		var (
 			itemMux sync.Mutex
 			losuj = true
-			itemTaken = false
 			losowyItem *pixel.Sprite
-			gurdyDead = false
 			plansza1 = true
 			isaacHp = 3
 			hpUp = false
@@ -257,19 +529,11 @@ func run() {
 		}
 	}()
 
-	// Deklaracja Gurdiego
-	var (
-		gurdys []*struktury_i_funkcje.Gurdy
-		gurdyMux sync.Mutex
-		gurdyRespawn = time.Now()
-		gurdyDrawn = false
-		bossGurdy *struktury_i_funkcje.Gurdy
-	)
 
 	// Funkcja generujaca Gurdiego
 	go func() {
 		for {
-			if time.Since(gurdyRespawn) >= 1*time.Millisecond && !gurdyDrawn && plansza1 {
+			if time.Since(gurdyRespawn) >= 1*time.Millisecond && !gurdyDrawn && currentRoom.Type == BossRoom {
 				gurdyMux.Lock()
 				bossGurdy = &struktury_i_funkcje.Gurdy {
 					Position: pixel.V(920, 520),
@@ -305,33 +569,43 @@ func run() {
 
 	// Zmiana planszy
 	var (
-		zmiana = false
+		zmiana = true
 		zmianaMux sync.Mutex
 	)
 
 	go func() {
 		for {
 			zmianaMux.Lock()
-			if gurdyDead {
+			if currentRoom.Type == BossRoom && gurdyDead {
 				zmiana = true
 			}
+			
+
 			if zmiana && plansza1 {
 				if drzwi.Contains(pos) {
-					zmiana = false
-					plansza1 = false
-					pos = pixel.V(931, 935)
-					poslza = pixel.V(931, 935)
+					if pos.Y > sciany.Max.Y-10 && currentRoom.Doors["up"] {
+						ChangeRoom("up")
+						pos = pixel.V(960, 220)
+					}
+					if pos.Y < sciany.Min.Y+10 && currentRoom.Doors["down"] {
+						ChangeRoom("down")
+						pos = pixel.V(960, 900)
+					}
+					if pos.X < sciany.Min.X+10 && currentRoom.Doors["left"] {
+						ChangeRoom("left")
+						pos = pixel.V(1500, 560)
+					}
+					if pos.X > sciany.Max.X-10 && currentRoom.Doors["right"] {
+						ChangeRoom("right")
+						pos = pixel.V(400, 560)
+					}
+					
 				}
 			}
 			zmianaMux.Unlock()
 		}
 	}()
-
-	// Deklaracja lez bossa
-	var (
-		bossTears []*struktury_i_funkcje.BossTear
-		bossTearsMux sync.Mutex
-	)
+	
 
 	// Funkcja strzelajaca lzami bossa
 	go func() {
@@ -493,13 +767,6 @@ func run() {
 	}()
 
 	// funkcja generujaca drugiego bossa
-	var (
-		hushes []*struktury_i_funkcje.Hush
-		hushMux sync.Mutex
-		hushDrawn = false
-		hushDead = false
-		bossHush *struktury_i_funkcje.Hush
-	)
 
 	go func() {
 		for {
@@ -962,7 +1229,7 @@ func run() {
 			pasek.Draw(win, pixel.IM.Moved(pixel.V(930, 110)))
 		}
 
-
+		DrawMiniMap(win)
 		win.Update()
 	}
 }
