@@ -6,6 +6,7 @@ import (
 	"time"
 	"image/color"
 	"math/rand"
+	"math"
 
 	_ "image/png"
 
@@ -15,6 +16,25 @@ import (
 	"github.com/faiface/pixel/imdraw"
 )
 
+type EnemyType int
+
+const (
+	Fly EnemyType = iota
+	Slime
+)
+
+type Enemy struct {
+	Position pixel.Vec
+	Type     EnemyType
+	Health   int
+	Active   bool
+	LastShot time.Time
+}
+
+var sciany pixel.Rect
+var itemPos pixel.Vec
+
+
 func DrawMiniMap(win *pixelgl.Window) {
 	im := imdraw.New(nil)
 
@@ -22,11 +42,12 @@ func DrawMiniMap(win *pixelgl.Window) {
 	spacing := 26.0
 
 	// pozycja minimapy
-	origin := pixel.V(80, 1000)
+	origin := pixel.V(70, 950)
 
 	// przesunięcie względem aktualnego pokoju
 	offsetX := float64(currentRoom.X) * spacing
 	offsetY := float64(currentRoom.Y) * spacing
+
 
 	for _, room := range gameMap {
 		x := origin.X + float64(room.X)*spacing - offsetX
@@ -49,6 +70,14 @@ func DrawMiniMap(win *pixelgl.Window) {
 			pixel.V(x+roomSize/2, y+roomSize/2),
 		)
 		im.Rectangle(0)
+
+		/* Pozycje drzwi – jak w Binding of Isaac
+		doorPositions := map[string]pixel.Vec{
+			"up":    pixel.V(960, sciany.Max.Y),
+			"down":  pixel.V(960, sciany.Min.Y),
+			"left":  pixel.V(sciany.Min.X, 560),
+			"right": pixel.V(sciany.Max.X, 560),
+		}*/
 
 		// połączenia (drzwi)
 		im.Color = colornames.Gray
@@ -106,24 +135,98 @@ var (
 	bossGurdy *struktury_i_funkcje.Gurdy
 )
 
+var (
+	enemies    []*Enemy
+	enemiesMux sync.Mutex
+)
+
+
 var itemTaken = false
+var itemCanBeTaken = true
+var itemGeneratedThisFloor = false
+var itemCollected = false
+var floorItem = make(map[int]*pixel.Sprite)
+var availableItems = []*pixel.Sprite{}
+var roomItemTaken = make(map[*Room]bool)
+var itemEffectApplied = make(map[*pixel.Sprite]bool)
+var losowyItem *pixel.Sprite
+var hasPiercing = false
+var bossItemSpawned = false
+var bossItemTaken = false
+
+var roomJustEntered = false
+var roomCleared = make(map[*Room]bool)
+var roomVisited = make(map[*Room]bool)
+
+var currentFloor = 1
+var exitActive = false
+var exitPos = pixel.V(960, 540)
+
+
 
 func OnEnterRoom() {
-	// reset bossów
-	gurdyDrawn = false
-	gurdyDead = true
-	gurdys = nil
 
-	hushDrawn = false
-	hushDead = false
-	hushes = nil
-
-	// reset pocisków
+	// bossowe pociski
 	bossTears = nil
+	bossGurdy = nil
 
-	// reset itemu
-	itemTaken = false
+	enemiesMux.Lock()
+	enemies = nil
+	enemiesMux.Unlock()
+
+	// ---------- TREASURE ROOM ----------
+	if currentRoom.Type == ItemRoom {
+		itemTaken = roomItemTaken[currentRoom]
+	
+		itemPos = pixel.V(
+			(sciany.Min.X+sciany.Max.X)/2,
+			((sciany.Min.Y+sciany.Max.Y)/2) + 40,
+		)
+	}
+	
+
+
+	if currentRoom.Type == NormalRoom || currentRoom.Type == BossRoom {
+		doorsLocked = !roomCleared[currentRoom]
+	} else {
+		doorsLocked = false
+	}	
+
+	// ===== BOSS ROOM =====
+	if currentRoom.Type == BossRoom && !roomVisited[currentRoom] {
+
+		exitActive = false
+		bossTears = nil
+	
+		if currentFloor == 1 {
+			gurdyMux.Lock()
+			bossGurdy = &struktury_i_funkcje.Gurdy{
+				Position: pixel.V(920, 520),
+				Active:   true,
+				Health:   300,
+			}
+			gurdys = []*struktury_i_funkcje.Gurdy{bossGurdy}
+			gurdyDead = false
+			gurdyDrawn = true
+			gurdyMux.Unlock()
+		}
+	
+		if currentFloor == 2 {
+			hushMux.Lock()
+			bossHush = &struktury_i_funkcje.Hush{
+				Position: pixel.V(920, 520),
+				Active:   true,
+				Health:   400,
+			}
+			hushes = []*struktury_i_funkcje.Hush{bossHush}
+			hushDead = false
+			hushDrawn = true
+			hushMux.Unlock()
+		}
+	}	
+
 }
+
 
 
 // ================= MAPA / POKOJE =================
@@ -270,7 +373,124 @@ func ChangeRoom(dir string) {
 	currentRoom = gameMap[[2]int{currentRoom.X + dx, currentRoom.Y + dy}]
 
 	OnEnterRoom()
+	roomJustEntered = true
+
+	if !roomVisited[currentRoom] {
+		SpawnEnemies()
+		roomVisited[currentRoom] = true
+	}
 }
+
+func NextFloor() {
+
+	roomItemTaken = make(map[*Room]bool)
+	currentFloor++
+
+	if currentFloor > 2 {
+		return // koniec gry
+	}
+
+	// reset mapy
+	gameMap = GenerateMap()
+	currentRoom = gameMap[[2]int{0, 0}]
+
+	// reset stanów
+	roomVisited = make(map[*Room]bool)
+	roomCleared = make(map[*Room]bool)
+	enemies = nil
+	bossTears = nil
+
+	// reset itemów
+	itemTaken = false
+	itemCollected = false
+
+	// reset bossów
+	gurdyDead = true
+	hushDead = true
+	gurdyDrawn = false
+	hushDrawn = false
+
+	exitActive = false
+
+	AssignFloorItem()
+	losowyItem = floorItem[currentFloor]
+	OnEnterRoom()
+}
+
+
+func DrawDoors(win *pixelgl.Window, room *Room,
+	drzwiGora, drzwiDol, drzwiLewo, drzwiPrawo *pixel.Sprite) {
+
+	for dir, exists := range room.Doors {
+		if !exists {
+			continue
+		}
+		
+		switch dir {
+		case "up":
+			drzwiGora.Draw(win, pixel.IM.Moved(
+				pixel.V(940, sciany.Max.Y+18),
+			))
+		case "down":
+			drzwiDol.Draw(win, pixel.IM.Moved(
+				pixel.V(940, sciany.Min.Y-105),
+			))
+		case "left":
+			drzwiLewo.Draw(win, pixel.IM.Moved(
+				pixel.V(sciany.Min.X-80, 540),
+			))
+		case "right":
+			drzwiPrawo.Draw(win, pixel.IM.Moved(
+				pixel.V(sciany.Max.X+80, 540),
+			))
+		}
+	}
+}
+
+
+func SpawnEnemies() {
+	if currentRoom.Type != NormalRoom {
+		return
+	}
+
+	count := rand.Intn(4) + 3 // 3–6
+
+	for i := 0; i < count; i++ {
+		t := Fly
+		if rand.Intn(2) == 0 {
+			t = Slime
+		}
+
+		x := rand.Float64()*(sciany.Max.X-sciany.Min.X) + sciany.Min.X
+		y := rand.Float64()*(sciany.Max.Y-sciany.Min.Y) + sciany.Min.Y
+
+		e := &Enemy{
+			Position: pixel.V(x, y),
+			Type:     t,
+			Health:   20,
+			Active:   true,
+			LastShot: time.Now(),
+		}
+
+		enemies = append(enemies, e)
+	}
+}
+
+var doorsLocked bool
+
+func IsRoomCleared() bool {
+	if currentRoom.Type == BossRoom {
+		return gurdyDead && hushDead
+	}
+
+	for _, e := range enemies {
+		if e.Active {
+			return false
+		}
+	}
+	return true
+}
+
 
 
 // ===== MAPA =====
@@ -279,12 +499,45 @@ var (
 	currentRoom *Room
 )
 
+func AssignFloorItem() {
+	if floorItem[currentFloor] != nil {
+		return
+	}
 
-func run() {
+	if len(availableItems) == 0 {
+		return
+	}
 
+	index := rand.Intn(len(availableItems))
+	floorItem[currentFloor] = availableItems[index]
+
+	// usuń z puli globalnej
+	availableItems = append(
+		availableItems[:index],
+		availableItems[index+1:]...,
+	)
+}
+
+func SpriteHitbox(pos pixel.Vec, sprite *pixel.Sprite, scale float64) pixel.Rect {
+	frame := sprite.Frame()
+
+	halfW := frame.W() * scale / 2
+	halfH := frame.H() * scale / 2
+
+	return pixel.R(
+		pos.X-halfW, pos.Y-halfH,
+		pos.X+halfW, pos.Y+halfH,
+	)
+}
+
+
+
+
+func run() {	
 
 	gameMap = GenerateMap()
 	currentRoom = gameMap[[2]int{0, 0}]
+	itemGeneratedThisFloor = false
 
 	// Wczytywanie okna
 	cfg := pixelgl.WindowConfig{
@@ -335,9 +588,15 @@ func run() {
 	pic9 := struktury_i_funkcje.LoadPicture("pasek.png")
 	pasek := pixel.NewSprite(pic9, pic9.Bounds())
 
-	// Wczytywanie drugiego tla
-	pic10 := struktury_i_funkcje.LoadPicture("tlo2.png")
-	tlo2 := pixel.NewSprite(pic10, pic10.Bounds())
+	// Wczytywanie drzwi
+	pic10 := struktury_i_funkcje.LoadPicture("drzwiGora.png")
+	drzwiGora := pixel.NewSprite(pic10, pic10.Bounds())
+	pic17 := struktury_i_funkcje.LoadPicture("drzwiDol.png")
+	drzwiDol := pixel.NewSprite(pic17, pic17.Bounds())
+	pic18 := struktury_i_funkcje.LoadPicture("drzwiLewo.png")
+	drzwiLewo := pixel.NewSprite(pic18, pic18.Bounds())
+	pic19 := struktury_i_funkcje.LoadPicture("drzwiPrawo.png")
+	drzwiPrawo := pixel.NewSprite(pic19, pic19.Bounds())
 
 	// Wczytywanie drugiego bossa
 	pic11 := struktury_i_funkcje.LoadPicture("hush.png")
@@ -363,6 +622,30 @@ func run() {
 	pic16 := struktury_i_funkcje.LoadPicture("healthUp.png")
 	mieso := pixel.NewSprite(pic16, pic16.Bounds())
 
+	// Wczytywanie przejscia
+	pic20 := struktury_i_funkcje.LoadPicture("drop.png")
+	drop := pixel.NewSprite(pic20, pic20.Bounds())
+
+	// Wczytywanie potworow
+	pic21 := struktury_i_funkcje.LoadPicture("mucha.png")
+	mucha := pixel.NewSprite(pic21, pic21.Bounds())
+	pic22 := struktury_i_funkcje.LoadPicture("follower.png")
+	follower := pixel.NewSprite(pic22, pic22.Bounds())
+	muchaScale := 0.42
+	followerScale := 1.0
+
+	// Wczytywanie pierca
+	pic23 := struktury_i_funkcje.LoadPicture("pierceUp.png")
+	pierceUp := pixel.NewSprite(pic23, pic23.Bounds())
+	pic25 := struktury_i_funkcje.LoadPicture("pierceDown.png")
+	pierceDown := pixel.NewSprite(pic25, pic25.Bounds())
+	pic26 := struktury_i_funkcje.LoadPicture("pierceRight.png")
+	pierceRight := pixel.NewSprite(pic26, pic26.Bounds())
+	pic27 := struktury_i_funkcje.LoadPicture("pierceLeft.png")
+	pierceLeft := pixel.NewSprite(pic27, pic27.Bounds())
+	pic24 := struktury_i_funkcje.LoadPicture("arrow.png")
+	arrow := pixel.NewSprite(pic24, pic24.Bounds())
+
 	pos := pixel.V(960, 340)
 	poslza := pos
 	speed := 7.5
@@ -373,19 +656,19 @@ func run() {
 
 
 	// Ograniczenie scian dla postaci
-	sciany := pixel.R(275, 210, 1585, 935)
+	sciany = pixel.R(275, 210, 1585, 935)
 	// Ograniczenie scian dla lez
 	scianyLzy := pixel.R(275, 210, 1585, 935)
 	// Ograniczenie scian dla znikania lez
 	scianyLzyOff := pixel.R(240, 153, 1620, 935)
 	// Ograniczenie ruchu postaci dla bossa
-	bossGurdySize := pixel.R(636, 557, 1245, 935)
+	bossGurdySize := pixel.R(636, 557, 1245, 735)
 	// Ograniczenie ruchu lez dla bossa
 	bossGurdySizeLzy := pixel.R(636, 557, 1245, 935)
 	// Kierunek ataku gurdiego
-	attackLeft := pixel.R(275, 210, 636, 935)
-	attackMiddle := pixel.R(637, 210, 1244, 557)
-	attackRight := pixel.R(1245, 210, 1585, 935)
+	//attackLeft := pixel.R(275, 210, 636, 935)
+	//attackMiddle := pixel.R(637, 210, 1244, 557)
+	//attackRight := pixel.R(1245, 210, 1585, 935)
 	// Czarny porstokat na pasek zycia bossa
 	czarneZycie := pixel.R(705, 87, 1180, 127)
 	// Czerwony porstokat na pasek zycia bossa
@@ -395,16 +678,33 @@ func run() {
 	// Czerwony porstokat na pasek zycia drugiego bossa
 	czerwoneZycie2 := pixel.R(705, 87, 1180, 127)
 	// Kwadrat na drzwi
-	drzwi := pixel.R(911, 200, 951, 220)
+	doorUp := pixel.R(820, sciany.Max.Y-5, 1100, sciany.Max.Y+20)
+	doorDown := pixel.R(820, sciany.Min.Y-20, 1100, sciany.Min.Y+5)
+	doorLeft := pixel.R(sciany.Min.X-20, 480, sciany.Min.X+5, 650)
+	doorRight := pixel.R(sciany.Max.X-5, 480, sciany.Max.X+20, 650)
+
 	// Ograniczenie dla drugiego bossa
 	bossHushSize := pixel.R(716, 407, 1136, 707)
 	// Piedestal
 	piedestalHitbox := pixel.R(880, 540, 980, 640)
-	wziacItem := pixel.R(881, 541, 981, 641)
+	wziacItem := pixel.R(870, 530, 990, 650)
+
+	availableItems = []*pixel.Sprite{
+		sok,
+		strzykawka,
+		but,
+		mieso,
+	}
+	AssignFloorItem()
+	losowyItem = floorItem[currentFloor]
+
 
 	gameMap = GenerateMap()
 	currentRoom = gameMap[[2]int{0, 0}]
 
+	if doorsLocked && IsRoomCleared() {
+		doorsLocked = false
+	}	
 
 	// Kolekcja lez
 	var (
@@ -416,85 +716,92 @@ func run() {
 		lifetime time.Duration
 	)
 
-		// Losowanie itemu po bossie
-		var (
-			itemMux sync.Mutex
-			losuj = true
-			losowyItem *pixel.Sprite
-			plansza1 = true
-			isaacHp = 3
-			hpUp = false
-		)
+	// Losowanie itemu po bossie
+	var (
+		itemMux sync.Mutex
+		plansza1 = true
+		isaacHp = 3
+	)
 
-		items := []*pixel.Sprite{
-			sok,
-			strzykawka,
-			but,
-			mieso,
-		}
+	/*items := []*pixel.Sprite{
+		sok,
+		strzykawka,
+		but,
+		mieso,
+	}
 
-		if losuj {
+	if floorItem[currentFloor] == nil {
 		index := rand.Intn(len(items))
-		losowyItem = items[index]
-		losuj = false
-		}
+		floorItem[currentFloor] = items[index]
+	}
+		
+	losowyItem = floorItem[currentFloor]*/
+
 	
-		// Funkcja uzywajaca itemow
+	// Funkcja uzywajaca itemow
 	
-		go func() {
-			for {
-				itemMux.Lock()
-				if losowyItem == mieso && itemTaken {
-					if !hpUp {
-						isaacHp = isaacHp + 1
-						hpUp = true
-					}
-				}
-				if losowyItem == sok && itemTaken {
-					sleep = 250*time.Millisecond
-				} else {
-					sleep = 333*time.Millisecond
-				}
-				if losowyItem == but && itemTaken {
-					lifetime = 2000*time.Millisecond
-				} else {
-					lifetime = 1300*time.Millisecond
-				}
-				if losowyItem == strzykawka && itemTaken {
-					damage = 15.0
-				} else {
-					damage = 10.0
-				}
-				itemMux.Unlock()
+	go func() {
+		for {
+
+			itemMux.Lock()
+			if losowyItem == mieso && itemTaken && !itemEffectApplied[losowyItem] {
+				isaacHp++
+				itemEffectApplied[losowyItem] = true
 			}
-		}()
+			if losowyItem == sok && itemTaken {
+				sleep = 250*time.Millisecond
+			} else {
+				sleep = 333*time.Millisecond
+			}
+			if losowyItem == but && itemTaken {
+				lifetime = 2000*time.Millisecond
+			} else {
+				lifetime = 1300*time.Millisecond
+			}
+			if losowyItem == strzykawka && itemTaken {
+				damage = 15.0
+			} else {
+				damage = 10.0
+			}
+			itemMux.Unlock()
+		}
+	}()
 
 	// Funkcja generujaca lzy
 	go func() {
 		for {
+
+			if roomJustEntered {
+				roomJustEntered = false
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
 			if win.Pressed(pixelgl.KeyUp) {
 				tearsMux.Lock()
 
-				tear = &struktury_i_funkcje.Tear {
-					Position: poslza,
+				tear = &struktury_i_funkcje.Tear{
+					Position: pos,
 					Velocity: pixel.V(0, 500),
 					StartTime: time.Now(),
 					Lifetime: lifetime,
 					Active: true,
 					Damage: damage,
-				}
+					Direction: "up",
+				}				
 				tears = append(tears, tear)
 				tearsMux.Unlock()
 			} else if win.Pressed(pixelgl.KeyDown) {
 				tearsMux.Lock()
 
 				tear = &struktury_i_funkcje.Tear {
-					Position: poslza,
+					Position: pos,
 					Velocity: pixel.V(0, -500),
 					StartTime: time.Now(),
 					Lifetime: lifetime,
 					Active: true,
 					Damage: damage,
+					Direction: "down",
 				}
 				tears = append(tears, tear)
 				tearsMux.Unlock()
@@ -502,12 +809,13 @@ func run() {
 				tearsMux.Lock()
 
 				tear = &struktury_i_funkcje.Tear {
-					Position: poslza,
+					Position: pos,
 					Velocity: pixel.V(500, 0),
 					StartTime: time.Now(),
 					Lifetime: lifetime,
 					Active: true,
 					Damage: damage,
+					Direction: "right",
 				}
 				tears = append(tears, tear)
 				tearsMux.Unlock()
@@ -515,12 +823,13 @@ func run() {
 				tearsMux.Lock()
 
 				tear = &struktury_i_funkcje.Tear {
-					Position: poslza,
+					Position: pos,
 					Velocity: pixel.V(-500, 0),
 					StartTime: time.Now(),
 					Lifetime: lifetime,
 					Active: true,
 					Damage: damage,
+					Direction: "left",
 				}
 				tears = append(tears, tear)
 				tearsMux.Unlock()
@@ -529,24 +838,6 @@ func run() {
 		}
 	}()
 
-
-	// Funkcja generujaca Gurdiego
-	go func() {
-		for {
-			if time.Since(gurdyRespawn) >= 1*time.Millisecond && !gurdyDrawn && currentRoom.Type == BossRoom {
-				gurdyMux.Lock()
-				bossGurdy = &struktury_i_funkcje.Gurdy {
-					Position: pixel.V(920, 520),
-					Active: true,
-					Health: 300,
-				}
-				gurdys = append(gurdys, bossGurdy)
-				gurdyDrawn = true
-				gurdyMux.Unlock()
-			}
-			time.Sleep(1*time.Millisecond)
-		}
-	}()
 
 	// Funkcja odejmujaca hp gurdiego
 	var ( 
@@ -576,173 +867,75 @@ func run() {
 	go func() {
 		for {
 			zmianaMux.Lock()
-			if currentRoom.Type == BossRoom && gurdyDead {
-				zmiana = true
-			}
+			zmiana = currentRoom.Type != BossRoom || gurdyDead
 			
 
 			if zmiana && plansza1 {
-				if drzwi.Contains(pos) {
-					if pos.Y > sciany.Max.Y-10 && currentRoom.Doors["up"] {
-						ChangeRoom("up")
-						pos = pixel.V(960, 220)
-					}
-					if pos.Y < sciany.Min.Y+10 && currentRoom.Doors["down"] {
-						ChangeRoom("down")
-						pos = pixel.V(960, 900)
-					}
-					if pos.X < sciany.Min.X+10 && currentRoom.Doors["left"] {
-						ChangeRoom("left")
-						pos = pixel.V(1500, 560)
-					}
-					if pos.X > sciany.Max.X-10 && currentRoom.Doors["right"] {
-						ChangeRoom("right")
-						pos = pixel.V(400, 560)
-					}
-					
+				if doorUp.Contains(pos) && currentRoom.Doors["up"] && !doorsLocked {
+					ChangeRoom("up")
+					pos = pixel.V(960, sciany.Min.Y+40)
+				}
+				if doorDown.Contains(pos) && currentRoom.Doors["down"] && !doorsLocked {
+					ChangeRoom("down")
+					pos = pixel.V(960, sciany.Max.Y-40)
+				}
+				if doorLeft.Contains(pos) && currentRoom.Doors["left"] && !doorsLocked {
+					ChangeRoom("left")
+					pos = pixel.V(sciany.Max.X-40, 560)
+				}
+				if doorRight.Contains(pos) && currentRoom.Doors["right"] && !doorsLocked {
+					ChangeRoom("right")
+					pos = pixel.V(sciany.Min.X+40, 560)
 				}
 			}
+			
 			zmianaMux.Unlock()
 		}
 	}()
 	
-
 	// Funkcja strzelajaca lzami bossa
 	go func() {
 		for {
-			if !gurdyDead && gurdyDrawn && plansza1{
-				if attackLeft.Contains(pos) {
-					bossTearsMux.Lock()
-					bossTear := &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 780),
-						Velocity: pixel.V(-425, 75),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 740),
-						Velocity: pixel.V(-425, -75),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 820),
-						Velocity: pixel.V(-350, 150),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 700),
-						Velocity: pixel.V(-350, -150),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 860),
-						Velocity: pixel.V(-275, 225),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(686, 660),
-						Velocity: pixel.V(-275, -225),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTearsMux.Unlock()
-				}
-				time.Sleep(700*time.Millisecond)
-				if attackMiddle.Contains(pos) {
-					bossTearsMux.Lock()
-					bossTear := &struktury_i_funkcje.BossTear {
-						Position: pixel.V(931, 607),
-						Velocity: pixel.V(0, -500),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(866, 607),
-						Velocity: pixel.V(-75, -425),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(996, 607),
-						Velocity: pixel.V(75, -425),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(801, 607),
-						Velocity: pixel.V(-150, -350),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1061, 607),
-						Velocity: pixel.V(150, -350),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(736, 607),
-						Velocity: pixel.V(-225, -275),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1126, 607),
-						Velocity: pixel.V(225, -275),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTearsMux.Unlock()
-				}
-				time.Sleep(700*time.Millisecond)
-				if attackRight.Contains(pos) {
-					bossTearsMux.Lock()
-					bossTear := &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 780),
-						Velocity: pixel.V(425, 75),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 740),
-						Velocity: pixel.V(425, -75),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 820),
-						Velocity: pixel.V(350, 150),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 700),
-						Velocity: pixel.V(350, -150),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 860),
-						Velocity: pixel.V(275, 225),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTear = &struktury_i_funkcje.BossTear {
-						Position: pixel.V(1195, 660),
-						Velocity: pixel.V(275, -225),
-						Active: true,
-					}
-					bossTears = append(bossTears, bossTear)
-					bossTearsMux.Unlock()
-				}
-				time.Sleep(700*time.Millisecond)
+			if gurdyDead || !gurdyDrawn || currentRoom.Type != BossRoom {
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
+	
+			bossTearsMux.Lock()
+	
+			// kierunek do gracza
+			dir := pos.Sub(bossGurdy.Position)
+			if dir.Len() == 0 {
+				dir = pixel.V(0, -1)
+			}
+			dir = dir.Unit()
+	
+			// parametry fali
+			bulletSpeed := 350.0
+			bulletCount := 7
+			spread := 0.6 // im większe, tym szerszy wachlarz
+	
+			for i := 0; i < bulletCount; i++ {
+				offset := float64(i-(bulletCount/2)) * spread
+				angle := math.Atan2(dir.Y, dir.X) + offset
+	
+				vel := pixel.V(
+					math.Cos(angle),
+					math.Sin(angle),
+				).Scaled(bulletSpeed)
+	
+				bossTears = append(bossTears, &struktury_i_funkcje.BossTear{
+					Position: bossGurdy.Position,
+					Velocity: vel,
+					Active:   true,
+				})
+			}
+	
+			bossTearsMux.Unlock()
+			time.Sleep(900 * time.Millisecond)
 		}
 	}()
+	
 
 	// Funkcja odejmujaca hp postaci
 	var (
@@ -766,24 +959,7 @@ func run() {
 		}
 	}()
 
-	// funkcja generujaca drugiego bossa
 
-	go func() {
-		for {
-			if !plansza1 && !hushDrawn {
-				hushMux.Lock()
-				bossHush = &struktury_i_funkcje.Hush {
-					Position: pixel.V(920, 520),
-					Active: true,
-					Health: 400,
-				}
-				hushes = append(hushes, bossHush)
-				hushDrawn = true
-				hushMux.Unlock()
-			}
-			time.Sleep(1*time.Millisecond)
-		}
-	}()
 	// Funkcja odejmujaca hp Husha
 	var ( 
 		hushHpMux sync.Mutex
@@ -890,7 +1066,7 @@ func run() {
 				bossTears = append(bossTears, bossTear)
 				bossTearsMux.Unlock()
 			}
-			time.Sleep(3*time.Second)
+			time.Sleep(1500*time.Millisecond)
 		}
 	}()
 
@@ -926,6 +1102,51 @@ func run() {
 			MoveRight = false
 			MoveLeft = false
 		}
+
+		enemiesMux.Lock()
+
+		for _, e := range enemies {
+			if !e.Active {
+				continue
+			}
+
+			// --- HITBOXY ---
+			var hitbox pixel.Rect
+
+			switch e.Type {
+			case Fly:
+				// 🟣 mucha – hitbox = sprite mucha
+				hitbox = SpriteHitbox(e.Position, mucha, muchaScale)
+
+			case Slime:
+				// 🟢 follower – hitbox = sprite follower
+				hitbox = SpriteHitbox(e.Position, follower, followerScale)
+
+				// kolizja gracza z followerem
+				if hitbox.Contains(pos) {
+					isaacGotHit = true
+				}
+			}
+
+
+			// (opcjonalnie) kolizja łez z enemy
+			for _, tear := range tears {
+				if tear.Active && hitbox.Contains(tear.Position) {
+					e.Health -= tear.Damage
+					if e.Health <= 0 {
+						e.Active = false
+					}
+			
+					// TYLKO jeśli NIE ma piercingu – łza znika
+					if !hasPiercing {
+						tear.Active = false
+					}
+				}
+			}			
+		}
+		enemiesMux.Unlock()
+
+		
 
 		// Obsluga animacji przy chodzeniu
 		if MoveLeft {
@@ -975,6 +1196,7 @@ func run() {
 
 		if sciany.Contains(NewPos) {
 			pos = NewPos
+			poslza = pos
 		} else {
 			if NewPos.X < sciany.Min.X {
          	   NewPos.X = sciany.Min.X
@@ -990,6 +1212,19 @@ func run() {
 			pos = NewPos
 		}
 
+		// ===== WEJŚCIE DO WYJŚCIA (NASTĘPNE PIĘTRO) =====
+		exitHitbox := pixel.R(
+			exitPos.X-40, exitPos.Y-40,
+			exitPos.X+40, exitPos.Y+40,
+		)
+
+		if exitActive && exitHitbox.Contains(pos) {
+			NextFloor()
+			roomJustEntered = true
+			pos = pixel.V(960, 340)
+		}
+
+
 		// Aktualizacja pozycji postaci przy zderzeniu z bossem
 		NewPos = pos
 		
@@ -1002,14 +1237,27 @@ func run() {
 			}
 		}
 
-		if gurdyDead && plansza1 && piedestalHitbox.Contains(NewPos) {
+		if gurdyDead && plansza1 && piedestalHitbox.Contains(NewPos) && currentRoom.Type == ItemRoom {
 			pos = oldPos
 		}
-		if gurdyDead && plansza1 && wziacItem.Contains(NewPos) {
-			if !itemTaken {
+		if currentRoom.Type == ItemRoom && !itemTaken {
+			if wziacItem.Contains(pos) && win.JustPressed(pixelgl.KeyE) {
 				itemTaken = true
+				itemCollected = true
+				roomItemTaken[currentRoom] = true
+
 			}
 		}
+
+		// ===== PODNOSZENIE ITEMU PO BOSSIE =====
+		if bossItemSpawned && !bossItemTaken {
+			bossItemHitbox := SpriteHitbox(itemPos, arrow, 1.0)
+
+			if bossItemHitbox.Contains(pos) && win.JustPressed(pixelgl.KeyE) {
+				bossItemTaken = true
+				hasPiercing = true
+			}
+		}		
 		
 		if !hushDead && hushDrawn {
 			if bossHushSize.Contains(NewPos) {
@@ -1042,11 +1290,13 @@ func run() {
 		// Aktualizacja pozycji lez przy zderzeniu z bossem
 		NewPosLza = poslza
 
-		if !gurdyDead {
-			if bossGurdySizeLzy.Contains(NewPosLza) {
-				poslza = oldPosLzy
+		if currentRoom.Type == BossRoom && !gurdyDead {
+			if bossGurdySize.Contains(NewPos) {
+				pos = oldPos
+				isaacGotHit = true
 			}
 		}
+		
 
 		if gurdyDead && plansza1 && piedestalHitbox.Contains(NewPosLza) {
 			poslza = oldPosLzy
@@ -1065,9 +1315,13 @@ func run() {
 		if plansza1 {
 			tlo.Draw(win, pixel.IM.Moved(pixel.V(930, 525)))
 		} else {
-			tlo2.Draw(win, pixel.IM.Moved(pixel.V(930, 525)))
+			return	//tlo2.Draw(win, pixel.IM.Moved(pixel.V(930, 525)))
 		}
 		zmianaMux.Unlock()
+
+		DrawDoors(win, currentRoom,
+			drzwiGora, drzwiDol, drzwiLewo, drzwiPrawo)
+		
 
 		// Rysowanie Gurdiego
 		gurdyMux.Lock()
@@ -1083,6 +1337,30 @@ func run() {
 	
 		gurdyMux.Unlock()
 
+		// ===== EXIT + ITEM PO BOSSIE =====
+		if currentRoom.Type == BossRoom &&
+		currentFloor == 1 &&
+		gurdyDead {
+
+			exitActive = true
+			drop.Draw(win, pixel.IM.Moved(exitPos))
+
+			// spawn itemu bossa (raz)
+			if !bossItemSpawned {
+				bossItemSpawned = true
+				bossItemTaken = false
+				itemPos = exitPos.Add(pixel.V(0, -80))
+			}
+
+			// rysowanie piedestału + arrow
+			if !bossItemTaken {
+				piedestal.Draw(win, pixel.IM.Moved(pixel.V(960, 340)))
+				arrow.Draw(win, pixel.IM.Moved(itemPos))
+			}
+		}
+
+
+
 		// Rysowanie Husha
 		hushMux.Lock()
 		for _, bossHush := range hushes {
@@ -1095,15 +1373,54 @@ func run() {
 		}
 		hushMux.Unlock()
 
+	enemiesMux.Lock()
+	for _, e := range enemies {
+		if !e.Active {
+			continue
+		}
+
+		if e.Type == Fly && time.Since(e.LastShot) > 1*time.Second {
+			bossTearsMux.Lock()
+			bossTears = append(bossTears, &struktury_i_funkcje.BossTear{
+				Position: e.Position,
+				Velocity: pos.Sub(e.Position).Unit().Scaled(300),
+				Active:   true,
+			})
+			bossTearsMux.Unlock()
+			e.LastShot = time.Now()
+		}
+		
+
+		dir := pos.Sub(e.Position)
+		if dir.Len() > 0 {
+			dir = dir.Unit()
+		}
+
+		switch e.Type {
+		case Fly:
+			e.Position = e.Position.Add(dir.Scaled(1.5))
+		case Slime:
+			e.Position = e.Position.Add(dir.Scaled(1.0))
+		}
+	}
+	enemiesMux.Unlock()
+
+
+		if IsRoomCleared() {
+			doorsLocked = false
+			roomCleared[currentRoom] = true
+		}
+	
+
 		// Rysowanie piedestalu i itemu
-		if gurdyDead && plansza1 {
+		if currentRoom.Type == ItemRoom && !itemTaken {
 			piedestal.Draw(win, pixel.IM.Moved(pixel.V(930, 540)))
 		}
 		
 		itemMux.Lock()
-		if gurdyDead && plansza1 && !itemTaken {
-			losowyItem.Draw(win, pixel.IM.Moved(pixel.V(935, 620)))
-		}
+		if currentRoom.Type == ItemRoom && !itemTaken && losowyItem != nil {
+			losowyItem.Draw(win, pixel.IM.Moved(itemPos))
+		}				
 		itemMux.Unlock()
 		
 		// Rysowanie postaci na tle
@@ -1122,13 +1439,26 @@ func run() {
 				if tear.Active {
 					if time.Since(tear.StartTime) <= tear.Lifetime {
 						tear.Position = tear.Position.Add(tear.Velocity.Scaled(dt))
-						lza.Draw(win, pixel.IM.Moved(tear.Position))
+						if hasPiercing {
+							switch tear.Direction {
+							case "up":
+								pierceUp.Draw(win, pixel.IM.Moved(tear.Position))
+							case "down":
+								pierceDown.Draw(win, pixel.IM.Moved(tear.Position))
+							case "left":
+								pierceLeft.Draw(win, pixel.IM.Moved(tear.Position))
+							case "right":
+								pierceRight.Draw(win, pixel.IM.Moved(tear.Position))
+							}
+						} else {
+							lza.Draw(win, pixel.IM.Moved(tear.Position))
+						}						
 
 						// Sprawdzanie kolizji ze sciana lub bossem
 						if !scianyLzyOff.Contains(tear.Position){
 							tear.Active = false
 						}
-						if !gurdyDead && gurdyDrawn {
+						if !gurdyDead && gurdyDrawn && currentRoom.Type == BossRoom {
 							if bossGurdySizeLzy.Contains(tear.Position) || bossGurdySizeLzy.Contains(tear.Position) {
 								tear.Active = false
 								gurdyHpMux.Lock()
@@ -1230,6 +1560,27 @@ func run() {
 		}
 
 		DrawMiniMap(win)
+
+		enemiesMux.Lock()
+		for _, e := range enemies {
+			if !e.Active {
+				continue
+			}
+
+			switch e.Type {
+			case Fly:
+				// 🟣 mucha
+				mucha.Draw(win, pixel.IM.Scaled(pixel.ZV, 0.42).Moved(e.Position))
+
+			case Slime:
+				// 🟢 follower
+				follower.Draw(win, pixel.IM.Moved(e.Position))
+			}
+		}
+enemiesMux.Unlock()
+
+
+
 		win.Update()
 	}
 }

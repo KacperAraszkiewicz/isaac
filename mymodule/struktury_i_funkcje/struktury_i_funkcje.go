@@ -18,6 +18,7 @@ type Tear struct {
 	Lifetime time.Duration
 	Active bool
 	Damage int
+	Direction string
 }
 
 // Struktura opisujaca lzy bossa
